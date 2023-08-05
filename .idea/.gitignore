@@ -13,3 +13,4 @@
 # 모델파일
 /models
 .checkpoints
+/__pycache__
