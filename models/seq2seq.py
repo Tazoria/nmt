@@ -196,6 +196,168 @@ class Generator(nn.Module):
 
 
 class Seq2Seq(nn.Module):
+    def __init__(
+            self,
+            input_size,
+            word_vec_size,
+            hidden_size,
+            output_size,
+            n_layers=4,
+            dropout_p=.2
+    ):
+        self.input_size = input_size,
+        self.word_vec_size = word_vec_size,
+        self.hidden_size = hidden_size,
+        self.output_size = output_size,
+        self.n_layers = n_layers,
+        self.dropout_p = dropout_p
 
-    def __init__(self):
-        pass
+        super(Seq2Seq, self).__init__()
+
+        self.emb_src = nn.Embedding(input_size, word_vec_size)
+        self.emb_dec = nn.Embedding(output_size, word_vec_size)
+
+        self.encoder = Encoder(
+            word_vec_size, hidden_size,
+            n_layers=n_layers, dropout_p=dropout_p,
+        )
+        self.decoder = Decoder(
+            word_vec_size, hidden_size,
+            n_layers, = n_layers, dropout_p = dropout_p,
+        )
+        self.attn = Attention(hidden_size)
+
+        self.concat = nn.Linear(hidden_size*2, hidden_size)
+        self.tanh = nn.Tanh()
+        self.generator = Generator(hidden_size, output_size)
+
+    def generate_mask(self, x, length):
+        mask = []
+
+        max_length = max(length)
+        for l in length:
+            if max_length-1 > 0:
+                # 샘플 시퀀스 길이가 샘플 시퀀스 최대 길이보다 작을 때
+                # pad 값들을 1로 만들어 어텐션 웨이트를 없앰
+                # tensor.new(): PyTorch에서 주어진 tensor의 속성(데이터 타입, 디바이스 등)을 그대로 유지하면서 새로운 tensor를 생성하는 데 사용되는 메서드
+                # new_zeros(), new_ones(), new_full()
+                mask += [torch.cat([x.new_ones(1,l).zero_(),
+                                    x.new_ones(1,(max_length-l))
+                                    ], dim=-1)]
+            else:
+                # 샘플의 시퀀스 길이가 샘플 시퀀스 최대 길이와 같을 때
+                # 마스크의 각 값들을 0으로 채움
+                mask += [x.new_ones(1,l)].zero_()
+
+            mask = torch.cat(mask, dim=0).bool()
+
+            return mask
+
+
+    def merge_encoder_hiddens(self, encoder_hiddens):
+        new_hiddens = []
+        new_cells = []
+
+        # |hiddens| = (#layers*2, bs, hs)
+        hiddens, cells = encoder_hiddens
+
+        # 양방향 LSTM - i번째와 (i+1)번째 레이어는 반대 방향
+        # 각 방향의 사이즈도 hidden size의 절반
+        # 나중에 하나의 히든 레이어로 concat
+        for i in range(0, hiddens.size(0), 2):
+            new_hiddens += [torch.cat([hiddens[i], hiddens[i+1]], dim=-1)]  # dim=-1: 맨 끝 차원에 맞춰주셈
+            new_cells += [torch.cat([cells[i], cells[i+1]], dim=-1)]
+
+        new_hiddens, new_cells = torch.stack(new_hiddens), torch.stack(new_cells)
+
+        return (new_hiddens, new_cells)
+    
+    def fast_merge_encoder_hiddens(self, encoder_hiddens):
+        # 양방향을 한 방향으로 합침
+        # 사이즈 변환 필요: (n_layers * 2, batch_size, hidden_size / 2) => (n_layers, batch_size, hidden_size)
+        # 변환작업은 view()메소드 만으로는 이루어지지 않을 것
+        h_0_tgt, c_0_tgt = encoder_hiddens
+        batch_size = h_0_tgt.size(1)
+
+        # |h_tgt|: (#layers*2, bs, hs/2)
+        #   transpose: (bs, #layers*2. hs/2)
+        #   view: (bs, #layers, hs)
+        #   transpose: (#layers, bs, hs)
+        # => 왜 이랬다 저랬다 함? view로 한번에 예쁘게 안바뀜(shape는 만들어지지만 내부 원소들 구성이 이상해짐)
+        # contiguous(): 메모리상에 예쁘게 잘 붙어있게 선언해주기
+        h_0_tgt = h_0_tgt.transpose(0, 1).contiguous().view(batch_size, -1, self.hidden_size).transpose(0, 1).contiguous()
+        c_0_tgt = c_0_tgt.transpose(0, 1).contiguous().view(batch_size, -1, self.hidden_size).transpose(0, 1).contiguous()
+
+        # merge_encoder_hiddens() 메소드를 사용해도됨 - 하지만 non-parallel way
+        # h_0_tgt = self.merge_encoder_hiddens(h_0_tgt)
+
+        # |h_src| = (batch_size, length, hidden_size)
+        # |h_0_tgt| = (n_layers, batch_size, hidden_size)
+        return h_0_tgt, c_0_tgt
+
+    def forward(self, src, tgt):
+        batch_size = tgt.size(0)
+
+        mask = None
+        x_length = None
+        if isinstance(src, tuple):
+            x, x_length = src
+            mask = self.generate_mask(x, x_length)
+            # |mask| = (batch_size, length)
+        else:
+            x = src
+
+        if isinstance(tgt, tuple):
+            tgt = tgt[0]
+
+        # 입력 문장의 모든 timestep을 위한 word embedding vectors
+        emb_src = self.emb_src(x)
+        # |emb_src| = (batch_size, length, word_vec_size)
+
+        # 인코더의 마지막 레이어의 히든스테이트가 디코더의 첫 히든 스테이트가 됨
+        h_src, h_0_tgt = self.encoder((emb_src, x_length))
+        # |h_src| = (batch_size, length, hidden_size)
+        # |h_0_tgt| = (n_layers * 2, batch_size, hidden_size / 2)
+
+        h_0_tgt = self.fast_merge_encoder_hiddens(h_0_tgt)
+        emb_tgt = self.emb_dec(tgt)
+        # |emb_tgt| = (batch_size, length, word_vec_size)
+        # generator에서 한번에 입력받아서 log확률로 바꿔줄것임(?)
+        h_tilde = []
+
+        h_t_tilde = None  # 첫 hidden state값이라 None
+        decoder_hidden = h_0_tgt  # 인코더의 마지막 hidden state값
+        # 마지막 timestep이 끝날때까지 디코더 동작시키기
+        for t in range(tgt.size(1)):
+            # Teacher Forcing: take each input from training set,
+            # not from the last time-step's output.
+            # Because of Teacher Forcing,
+            # training procedure and inference procedure becomes different.
+            # Of course, because of sequential running in decoder,
+            # this causes severe bottle-neck.
+            # input feeding했기 때문에 디코더 자체는 한 타입스텝씩 돎
+            # unsqueeze(1): 어차피 사실 emb_tgt[:,t:,:]는 (bs, (1, 날아가버림), ws)이지만 명시적으로 해주어 덜 헷갈리게!
+            emb_t = emb_tgt[:, t, :].unsqueeze(1)
+            # |emb_t| = (batch_size, 1, word_vec_size)
+            # |h_t_tilde| = (batch_size, 1, hidden_size)
+
+            decoder_output, decoder_hidden = self.decoder(emb_t, h_t_tilde, decoder_hidden)
+            # |decoder_output| = (batch_size, 1, hidden_size)
+            # |decoder_hidden| = (n_layers, batch_size, hidden_size)
+
+            context_vector = self.attn(h_src, decoder_output, mask)
+            # |context_vector| = (batch_size, 1, hidden_size)
+
+            h_t_tilde = self.tanh(self.concat(torch.cat([decoder_output, context_vector], dim=-1)))
+
+            # |h_t_tilde| = (batch_size, 1, hidden_size)
+
+            h_tilde += [h_t_tilde]
+
+        h_tilde = torch.cat(h_tilde, dim=1)
+        # |h_tilde| = (batch_size, length, hidden_size)
+
+        y_hat = self.generator(h_tilde)
+        # |y_hat| = (batch_size, length, output_size)
+
+        return y_hat
